@@ -1,0 +1,189 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © KinetiCapital
+
+//@version=6
+indicator("X ATM Option Ladder Flow", shorttitle="X ATM Ladder", overlay=false)
+
+// Define timezone for date calculations
+string tz = "America/New_York"
+
+notegroup = input.bool(true, "** real time option pricing requires seperate subscription on TV **")
+
+//──────────────────────────────────────
+// NY regular-session mask
+//──────────────────────────────────────
+sess_start = timestamp("America/New_York", year, month, dayofmonth, 9, 30)
+sess_end   = timestamp("America/New_York", year, month, dayofmonth, 16, 15)
+in_session = time >= sess_start and time < sess_end
+
+//──────────────────────────────────────
+// Inputs
+//──────────────────────────────────────
+underlying           = input.string("QQQ", "Underlying", options=["QQQ","SPY"])
+expiryYYMMDD_input   = input.string("", "DTE (YYMMDD)", tooltip="enter today for 0DTE or any future date in format YYMMDD")
+string expiryYYMMDD_active = expiryYYMMDD_input
+bool   exp_ok = str.length(expiryYYMMDD_active) == 6
+
+strike_step         = 1
+anchor_strike_input = input.float(604.0, "Anchor Strike", step=1.0, tooltip="Start near RTH open. Ladder tracks ±8 around this anchor. If price exits the band, either recenter or accept nearest strike inside range.")
+anchor_offset_steps = 0
+ladder_depth        = 8
+auto_nudge          = true
+agg_pm1             = false
+
+//──────────────────────────────────────
+// Underlying
+//──────────────────────────────────────
+_SPY = ticker.new("BATS", "SPY", session.extended)
+_QQQ = ticker.new("BATS", "QQQ", session.extended)
+baseSym = underlying == "QQQ" ? _QQQ : _SPY
+[under_px] = request.security(baseSym, timeframe.period, [close], barmerge.gaps_off, barmerge.lookahead_off)
+
+f_round_to_step(_x, _step) => math.round(_x / _step) * _step
+k0 = anchor_strike_input + anchor_offset_steps * strike_step
+suggested_strike_series = f_round_to_step(under_px, strike_step)
+stale = math.abs(k0 - suggested_strike_series) >= (ladder_depth * strike_step)
+
+//──────────────────────────────────────
+// Visuals
+//──────────────────────────────────────
+call_bar_col = input.color(color.rgb(19,93,140,42), "Call", inline='call')
+call_dot_col = input.color(color.rgb(24,144,219), "", inline='call')
+put_bar_col  = input.color(color.rgb(142,42,42,42), "Put", inline='put')
+put_dot_col  = input.color(color.rgb(203,17,17), "", inline='put')
+table_text_color = input.color(color.white, "Table Text", inline = "tablec")
+table_text_bgc = input.color(color.rgb(54,58,69,100), "", inline = "tablec")
+
+//──────────────────────────────────────
+// Ladder arrays (built once per compile)
+//──────────────────────────────────────
+f_sym(_u, _exp, _cp, _strike) =>
+    s = str.format("{0,number,0.0}", _strike)
+    "OPRA:" + _u + _exp + _cp + s
+
+int maxRing = ladder_depth + 1
+int total   = 2 * maxRing + 1
+var string[] callSyms = array.new_string()
+var string[] putSyms  = array.new_string()
+var float[]  vCall    = array.new_float()
+var float[]  vPut     = array.new_float()
+var float[]  cCall    = array.new_float()
+var float[]  cPut     = array.new_float()
+var bool[]   upCall   = array.new_bool()
+var bool[]   upPut    = array.new_bool()
+
+if array.size(callSyms) != total
+    array.clear(callSyms), array.clear(putSyms)
+    array.clear(vCall), array.clear(vPut)
+    array.clear(cCall), array.clear(cPut)
+    array.clear(upCall), array.clear(upPut)
+    for i = -maxRing to maxRing
+        k = k0 + i * strike_step
+        array.push(callSyms, f_sym(underlying, expiryYYMMDD_active, "C", k))
+        array.push(putSyms,  f_sym(underlying, expiryYYMMDD_active, "P", k))
+        array.push(vCall, na), array.push(vPut, na)
+        array.push(cCall, na), array.push(cPut, na)
+        array.push(upCall, false), array.push(upPut, false)
+
+//──────────────────────────────────────
+// Fetch & compute per lane (tuples; tolerant to missing symbols)
+//──────────────────────────────────────
+for i = 0 to array.size(callSyms) - 1
+    cSym = array.get(callSyms, i)
+    pSym = array.get(putSyms, i)
+    [vC, cC, upC] = request.security(cSym, timeframe.period, [volume, close, close > close[1]], barmerge.gaps_off, barmerge.lookahead_off, ignore_invalid_symbol=true)
+    [vP, cP, upP] = request.security(pSym, timeframe.period, [volume, close, close > close[1]], barmerge.gaps_off, barmerge.lookahead_off, ignore_invalid_symbol=true)
+    array.set(vCall, i, vC), array.set(vPut,  i, vP)
+    array.set(cCall, i, cC), array.set(cPut,  i, cP)
+    array.set(upCall, i, upC), array.set(upPut,  i, upP)
+
+//──────────────────────────────────────
+// Lane selection
+//──────────────────────────────────────
+f_idx(_lane) =>
+    math.min(math.max(_lane + maxRing, 0), array.size(vCall) - 1)
+
+float dSteps = (under_px - k0) / strike_step
+int selLane  = auto_nudge ? math.round(dSteps) : 0
+selLane      := math.min(math.max(selLane, -ladder_depth), ladder_depth)
+
+f_sum3(_arr, _i) =>
+    v  = array.get(_arr, _i)
+    vp = _i + 1 < array.size(_arr) ? array.get(_arr, _i + 1) : na
+    vm = _i - 1 >= 0              ? array.get(_arr, _i - 1) : na
+    nz(v,0) + nz(agg_pm1 ? vp : na, 0) + nz(agg_pm1 ? vm : na, 0)
+
+int idx = f_idx(selLane)
+vol_call_sel = f_sum3(vCall, idx)
+vol_put_sel  = f_sum3(vPut,  idx)
+call_up = array.get(upCall, idx)
+put_up  = array.get(upPut,  idx)
+
+// Lane validity (also requires a valid 6-char expiry)
+lane_ok = exp_ok and (not na(array.get(cCall, idx)) or not na(array.get(cPut, idx)) or not na(array.get(vCall, idx)) or not na(array.get(vPut, idx)))
+
+//──────────────────────────────────────
+// Mask and plots
+//──────────────────────────────────────
+vol_call_plot = in_session and lane_ok ? vol_call_sel : na
+vol_put_plot  = in_session and lane_ok ? vol_put_sel  : na
+call_up_plot  = in_session and lane_ok ? (call_up ? vol_call_sel : na) : na
+put_up_plot   = in_session and lane_ok ? (put_up  ? vol_put_sel  : na) : na
+
+plot(vol_call_plot, title="Call Vol", style=plot.style_columns, linewidth=1, color=call_bar_col)
+plot(vol_put_plot,  title="Put Vol",  style=plot.style_columns, linewidth=1, color=put_bar_col)
+plot(call_up_plot,  title="Call Up Dot", style=plot.style_circles, color=call_dot_col, linewidth=1)
+plot(put_up_plot,   title="Put Up Dot",  style=plot.style_circles, color=put_dot_col,  linewidth=1)
+hline(0, "Zero", color=color.new(color.gray, 80))
+
+// table//
+
+active_k = k0 + selLane * strike_step
+lane_txt = selLane == 0 ? "0" : selLane > 0 ? "+" + str.tostring(selLane) : str.tostring(selLane)
+outside  = math.abs((under_px - active_k) / strike_step) > ladder_depth ? " •outside" : ""
+var table tStatus = table.new(position.bottom_right, 1, 5, border_width=1)
+if barstate.islast
+    table.cell(tStatus, 0, 0, str.format("{0}  {1}", underlying, str.tostring(under_px, format.mintick)), text_color=table_text_color, text_size=size.small, bgcolor=table_text_bgc, text_halign=text.align_right, text_valign=text.align_center)
+    table.cell(tStatus, 0, 1, " DTE: " + (exp_ok ? expiryYYMMDD_active : "—"), text_color=table_text_color, text_size=size.small, bgcolor=table_text_bgc, text_halign=text.align_right, text_valign=text.align_center)
+    table.cell(tStatus, 0, 2, in_session ? str.format(" Active: {0} ({1})", str.tostring(active_k, format.mintick), lane_txt) : " option market closed", text_color=in_session ? table_text_color : table_text_color, text_size=size.small, bgcolor=table_text_bgc, text_halign=text.align_right, text_valign=text.align_center)
+    table.cell(tStatus, 0, 3, (stale ? " ⚠︎" : "") + outside, text_color=table_text_color, text_size=size.small, bgcolor=table_text_bgc, text_halign=text.align_right, text_valign=text.align_center)
+    table.cell(tStatus, 0, 4, str.format(" Anchor: {0}   ±{1}", str.tostring(k0, format.mintick), ladder_depth), text_color=table_text_color, text_size=size.small, bgcolor=table_text_bgc, text_halign=text.align_right, text_valign=text.align_center)
+
+
+//──────────────────────────────────────
+// Center notice if selected option lane is missing / invalid expiry
+//──────────────────────────────────────
+var table tMissing = table.new(position.middle_center, 1, 3, border_width=1)
+if barstate.islast
+    table.cell(tMissing, 0, 0, lane_ok ? "" : (exp_ok ? "Option contract does not exist for this expiry/anchor." : "DTE in settings is empty. Enter a date as YYMMDD (e.g., 251107)."), text_color=table_text_color, text_size=size.small, bgcolor=lane_ok ? table_text_bgc : table_text_bgc, text_halign=text.align_center, text_valign=text.align_center)
+    table.cell(tMissing, 0, 1, lane_ok ? "" : (exp_ok ? "Make sure date is today/in future and anchor strike is within reasonable range of underlying" : ""), text_color=table_text_color, text_size=size.small, bgcolor=lane_ok ? table_text_bgc : table_text_bgc, text_halign=text.align_center, text_valign=text.align_center)
+    table.cell(tMissing, 0, 2, lane_ok ? "" : (exp_ok ? "TradingView does not retain prices for expired option contracts." : ""), text_color=table_text_color, text_size=size.small, bgcolor=lane_ok ? table_text_bgc : table_text_bgc, text_halign=text.align_center, text_valign=text.align_center)
+
+//──────────────────────────────────────
+// Expiry-date mismatch notice (separate from main table and from tMissing)
+//──────────────────────────────────────
+//──────────────────────────────────────
+// Parse expiry input as YYMMDD parts (safe dynamic casting)
+//──────────────────────────────────────
+float expYY = str.length(expiryYYMMDD_input) == 6 ? str.tonumber(str.substring(expiryYYMMDD_input, 0, 2)) : na
+float expMM = str.length(expiryYYMMDD_input) == 6 ? str.tonumber(str.substring(expiryYYMMDD_input, 2, 4)) : na
+float expDD = str.length(expiryYYMMDD_input) == 6 ? str.tonumber(str.substring(expiryYYMMDD_input, 4, 6)) : na
+
+//──────────────────────────────────────
+// Current (chart) date components in NY time
+//──────────────────────────────────────
+int currYY = year(time, tz) % 100
+int currMM = month(time, tz)
+int currDD = dayofmonth(time, tz)
+// Expired if today's date > entered expiry
+bool isExpired = not na(expYY) and not na(expMM) and not na(expDD) and ((currYY > expYY) or (currYY == expYY and currMM > expMM) or (currYY == expYY and currMM == expMM and currDD > expDD))
+
+//──────────────────────────────────────
+// Top-center: market-closed notice
+//──────────────────────────────────────
+var table tClosed = table.new(position.top_center, 1, 1, border_width=1)
+if barstate.islast
+    bool showClosed = not in_session
+    string msg = showClosed ? "OPTION MARKET OPENS at 9:30am EST.  Nothing will plot outside of RTH" : ""
+    color bg = showClosed ? color.rgb(54,58,69,100) : color.new(color.black, 100)
+    table.cell(tClosed, 0, 0, msg, text_color=color.white, text_size=size.small, bgcolor=bg, text_halign=text.align_center, text_valign=text.align_center)
